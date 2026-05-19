@@ -1,0 +1,9 @@
+============================================================
+STUDENT NAME : Krystal Yamin
+LAB ASSIGNMENT : Lab 01
+============================================================
+[GITHUB REPOSITORY LINK]
+https://github.com/krystalyamin/ai-bootcamp-2026-lab
+[STREAMLIT LIVE APPLICATION LINK]
+https://krystal-ai-bootcamp-2026-lab01.streamlit.app/
+============================================================
