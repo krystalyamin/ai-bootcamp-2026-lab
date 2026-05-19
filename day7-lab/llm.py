@@ -1,14 +1,13 @@
 """
-llm.py — single LiteLLM wrapper used by every other module.
+llm.py — single Groq wrapper used by every other module.
 
 All LLM calls in this project go through ask_json() or ask_text().
-No other module imports litellm directly.
+No other module imports groq directly.
 
-Supported MODEL prefixes (set in .env):
-    openai/...    — cloud; requires OPENAI_API_KEY
-    anthropic/... — cloud; requires ANTHROPIC_API_KEY
-    ollama/...    — local; requires `ollama serve` and the model to be pulled;
-                    no API key; reads OLLAMA_API_BASE (default localhost:11434)
+Requires:
+    GROQ_API_KEY  — your Groq API key (set in .env)
+    MODEL         — model string, e.g. "llama-3.3-70b-versatile" (default)
+                    See https://console.groq.com/docs/models for full list.
 """
 
 import json
@@ -17,12 +16,13 @@ import sys
 import time
 
 from dotenv import load_dotenv
-from litellm import completion
-import litellm
+from groq import Groq, AuthenticationError, RateLimitError, APIConnectionError
 
 load_dotenv()
 
-_MODEL = os.getenv("MODEL", "openai/gpt-4o-mini")
+_MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
+
+_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # Phrases that indicate the LLM violated the anti-rewrite rule.
 _REWRITE_MARKERS = ("here is a rewritten", "improved version:")
@@ -32,35 +32,10 @@ _REWRITE_MARKERS = ("here is a rewritten", "improved version:")
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _is_ollama(model: str) -> bool:
-    return model.startswith("ollama/")
-
-
-def _call_kwargs(model: str, messages: list, temperature: float, max_tokens: int) -> dict:
-    """Build keyword arguments for a litellm completion() call."""
-    kwargs: dict = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if _is_ollama(model):
-        # Ollama does not support response_format on all models; omit it.
-        # Omit max_tokens so Ollama uses its full context window (equiv. to -2).
-        # Cloud routes need an explicit limit both for cost control and because
-        # OpenAI/Anthropic reject non-positive max_tokens values.
-        kwargs["api_base"] = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
-    else:
-        # openai/* and anthropic/* both honour JSON mode.
-        kwargs["response_format"] = {"type": "json_object"}
-        kwargs["max_tokens"] = max_tokens
-    return kwargs
-
-
 def _strip_fences(text: str) -> str:
     """Remove leading ```json / ``` and trailing ``` markdown fences."""
     text = text.strip()
     if text.startswith("```"):
-        # Drop the opening fence line (e.g. ```json\n...)
         newline = text.find("\n")
         text = text[newline + 1:] if newline != -1 else text[3:]
     if text.endswith("```"):
@@ -75,10 +50,10 @@ def _parse_json(text: str) -> dict:
 
     Strategy:
         1. Find the first '{' and use JSONDecoder.raw_decode() to parse exactly
-            one object starting there, stopping at the matching '}' and ignoring
-            anything after it.
+           one object starting there, stopping at the matching '}' and ignoring
+           anything after it.
         2. Fall back to plain json.loads() on the full text so the error message
-            is useful if no '{' is found at all.
+           is useful if no '{' is found at all.
 
     Raises json.JSONDecodeError if parsing fails.
     """
@@ -86,7 +61,6 @@ def _parse_json(text: str) -> dict:
     if start != -1:
         obj, _ = json.JSONDecoder().raw_decode(text, start)
         return obj  # type: ignore[return-value]
-    # No '{' found — attempt full parse so the JSONDecodeError is informative.
     return json.loads(text)  # type: ignore[return-value]
 
 
@@ -109,15 +83,6 @@ def _check_no_rewrite(data: object, path: str = "") -> None:
                 )
 
 
-def _raise_auth_error(model: str, exc: Exception) -> None:
-    """Raise a RuntimeError naming the missing env var for the chosen route."""
-    var = "ANTHROPIC_API_KEY" if model.startswith("anthropic/") else "OPENAI_API_KEY"
-    raise RuntimeError(
-        f"{var} is invalid or missing for route '{model}'. "
-        "Check your .env file."
-    ) from exc
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -130,14 +95,13 @@ def ask_json(
     max_tokens: int = 1500,
 ) -> dict:
     """
-    Send (system, user) to the configured LLM, expect JSON, return as dict.
+    Send (system, user) to the configured Groq model, expect JSON, return as dict.
 
     Retries up to 3 times: on RateLimitError (exponential back-off 1s, 2s)
     and on JSONDecodeError (sends a correction message asking for valid JSON).
     Raises RuntimeError on authentication failure, connection failure, or
     if JSON cannot be parsed after the retry.
     """
-    model = _MODEL
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -145,47 +109,35 @@ def ask_json(
 
     for attempt in range(3):
         try:
-            response = completion(**_call_kwargs(model, messages, temperature, max_tokens))
+            response = _client.chat.completions.create(
+                model=_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
 
-        except litellm.RateLimitError:
-            # Rate limit hit — back off and retry (max 2 sleeps before giving up).
+        except RateLimitError:
             if attempt < 2:
-                sleep_secs = 2 ** attempt   # 1s, then 2s
+                sleep_secs = 2 ** attempt  # 1s, then 2s
                 print(f"Rate limit; retrying in {sleep_secs}s…", file=sys.stderr)
                 time.sleep(sleep_secs)
                 continue
             raise RuntimeError("Rate limit exceeded after 3 attempts. Try again later.")
 
-        except litellm.AuthenticationError as exc:
-            # Auth failure — name the missing env var so the student can fix it.
-            _raise_auth_error(model, exc)
+        except AuthenticationError as exc:
+            raise RuntimeError(
+                "GROQ_API_KEY is invalid or missing. Check your .env file."
+            ) from exc
 
-        except litellm.APIConnectionError as exc:
-            # Connection failure — Ollama not running, or network error.
-            if _is_ollama(model):
-                api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
-                raise RuntimeError(
-                    f"Cannot reach Ollama at {api_base}. Is `ollama serve` running?"
-                ) from exc
-            raise RuntimeError(f"API connection error: {exc}") from exc
-
-        except Exception as exc:
-            # Catch Ollama "model not found" (surfaces as a non-litellm error).
-            msg = str(exc).lower()
-            if _is_ollama(model) and ("not found" in msg or "unknown model" in msg):
-                model_name = model.removeprefix("ollama/")
-                raise RuntimeError(
-                    f"Ollama model '{model_name}' not found. "
-                    f"Run: ollama pull {model_name}"
-                ) from exc
-            raise
+        except APIConnectionError as exc:
+            raise RuntimeError(f"Cannot reach Groq API. Check your network connection: {exc}") from exc
 
         # ---- response received ----
 
         choice = response.choices[0]
 
         if choice.finish_reason == "length":
-            # Output was cut off mid-token — warn but try to parse anyway.
             print(
                 "WARNING: finish_reason='length'; response was truncated. "
                 "JSON may be incomplete.",
@@ -237,55 +189,40 @@ def ask_text(
     max_tokens: int = 600,
 ) -> str:
     """
-    Send (system, user) to the LLM, return plain text.
+    Send (system, user) to the Groq model, return plain text.
 
     Same retry behaviour as ask_json for RateLimitError and
     AuthenticationError. Does not request JSON mode.
     """
-    model = _MODEL
-    # For ask_text, never pass response_format — we want plain text.
-    kwargs: dict = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": temperature,
-    }
-    if _is_ollama(model):
-        kwargs["api_base"] = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
-    else:
-        kwargs["max_tokens"] = max_tokens
-
     for attempt in range(3):
         try:
-            response = completion(**kwargs)
-        except litellm.RateLimitError:
-            # Back off and retry on rate limit.
+            response = _client.chat.completions.create(
+                model=_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        except RateLimitError:
             if attempt < 2:
                 sleep_secs = 2 ** attempt
                 print(f"Rate limit; retrying in {sleep_secs}s…", file=sys.stderr)
                 time.sleep(sleep_secs)
                 continue
             raise RuntimeError("Rate limit exceeded after 3 attempts.")
-        except litellm.AuthenticationError as exc:
-            _raise_auth_error(model, exc)
-        except litellm.APIConnectionError as exc:
-            if _is_ollama(model):
-                api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
-                raise RuntimeError(
-                    f"Cannot reach Ollama at {api_base}. Is `ollama serve` running?"
-                ) from exc
-            raise RuntimeError(f"API connection error: {exc}") from exc
-        except Exception as exc:
-            msg = str(exc).lower()
-            if _is_ollama(model) and ("not found" in msg or "unknown model" in msg):
-                model_name = model.removeprefix("ollama/")
-                raise RuntimeError(
-                    f"Ollama model '{model_name}' not found. "
-                    f"Run: ollama pull {model_name}"
-                ) from exc
-            raise
+
+        except AuthenticationError as exc:
+            raise RuntimeError(
+                "GROQ_API_KEY is invalid or missing. Check your .env file."
+            ) from exc
+
+        except APIConnectionError as exc:
+            raise RuntimeError(
+                f"Cannot reach Groq API. Check your network connection: {exc}"
+            ) from exc
 
         return response.choices[0].message.content or ""
 
